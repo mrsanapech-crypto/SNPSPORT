@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#0a0d14" />
+    </linearGradient>
+    <linearGradient id="goldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fbbf24" />
+      <stop offset="100%" stop-color="#d97706" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)" />
+  <rect x="36" y="36" width="440" height="440" rx="92" fill="none" stroke="url(#goldGrad)" stroke-width="12" opacity="0.85" />
+  <circle cx="256" cy="210" r="88" fill="url(#goldGrad)" />
+  <polygon points="256,154 290,180 276,222 236,222 222,180" fill="#0a0d14" />
+  <text x="256" y="392" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="94" fill="#f59e0b" text-anchor="middle" letter-spacing="4">SNP</text>
+  <text x="256" y="442" font-family="Arial, Helvetica, sans-serif" font-weight="800" font-size="38" fill="#f8fafc" text-anchor="middle" letter-spacing="8">SPORT</text>
+</svg>

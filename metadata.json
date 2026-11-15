@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Remix GoalKhmer Live — Football Scores, Streams \u0026 Stats",
+  "description": "កម្មវិធីបាល់ទាត់ផ្សាយផ្ទាល់ កាលវិភាគប្រកួត ស្ថិតិ តារាងពិន្ទុ និង Live Stream សម្រាប់លីគធំៗ និងជម្រើសជាតិធំៗ ជាមួយទិន្នន័យផ្ទាល់ពី Google។",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
