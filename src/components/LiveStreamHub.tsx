@@ -22,6 +22,9 @@ import {
   resolveTeamShortCode,
 } from '../utils/footballLogic';
 import {
+  PPV_STREAMS_API_URL,
+  STREAM_BASE_URL,
+  normalizeToPpvSt,
   toSandboxSafeStreamUrl,
   isNativeApp,
   getApiBaseUrl,
@@ -37,13 +40,60 @@ interface LiveStreamHubProps {
   onSyncSelectedMatchId?: (matchId: string) => void;
 }
 
-function normalizeToStrmfreePk(rawUrl?: string | null): string {
-  const trimmed = String(rawUrl || '').trim();
-  if (!trimmed) return '';
-  return trimmed.replace(
-    /^https?:\/\/(?:www\.)?(?:streamfree\.pk\.top|strmfree\.pk\.st|streamfree\.top|strmfree\.st|streamfree\.pk|strmfree\.pk)/i,
-    'https://strmfree.pk'
+function parsePpvFootballStreams(raw: any): StreamFreeMatchItem[] {
+  if (!Array.isArray(raw?.streams)) return [];
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  const footballCat = raw.streams.find(
+    (c: any) => String(c?.category || '').toLowerCase() === 'football'
   );
+  if (!footballCat || !Array.isArray(footballCat.streams)) return [];
+
+  return footballCat.streams
+    .map((item: any) => {
+      const startsAt = Number(item.starts_at || 0);
+      const endsAt = Number(item.ends_at || 0);
+      const isLive =
+        Boolean(item.always_live) ||
+        (startsAt > 0 && nowSec >= startsAt - 900 && (endsAt === 0 || nowSec <= endsAt));
+
+      const sources: StreamSourceItem[] = [];
+
+      const primaryUrl = String(
+        item.iframe || (item.uri_name ? `${STREAM_BASE_URL}/live/${item.uri_name}` : '')
+      ).trim();
+
+      if (primaryUrl) {
+        sources.push({
+          url: normalizeToPpvSt(primaryUrl),
+          quality: String(item.source_tag || 'HD').trim(),
+          live: isLive,
+        });
+      }
+
+      if (Array.isArray(item.substreams)) {
+        for (const sub of item.substreams) {
+          const subUrl = String(
+            sub?.iframe || (sub?.uri_name ? `${STREAM_BASE_URL}/live/${sub.uri_name}` : '')
+          ).trim();
+          if (subUrl) {
+            sources.push({
+              url: normalizeToPpvSt(subUrl),
+              quality: String(sub.source_tag || 'SD').trim(),
+              live: isLive,
+            });
+          }
+        }
+      }
+
+      return {
+        id: String(item.id || item.uri_name || item.name),
+        name: String(item.name || 'Live Match'),
+        league: String(item.tag || item.category_name || 'Football'),
+        sources,
+      };
+    })
+    .filter((m: StreamFreeMatchItem) => m.sources.length > 0);
 }
 
 function findMatchingLiveFixture(
@@ -127,7 +177,7 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
           name: matchName,
           league: m.leagueName,
           sources: m.streams.map((st) => ({
-            url: toSandboxSafeStreamUrl(normalizeToStrmfreePk(st.embedUrl), matchName),
+            url: toSandboxSafeStreamUrl(normalizeToPpvSt(st.embedUrl), matchName),
             quality: st.quality,
             live: true,
           })),
@@ -153,7 +203,7 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
     }
   };
 
-  const fetchStreamFreeMatches = async (silent = false) => {
+  const fetchPpvFootballMatches = async (silent = false) => {
     if (!silent) {
       setLoadingSoccerHub(true);
     }
@@ -161,7 +211,7 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
       const isCapacitorOrFileEnv = isNativeApp();
       const hasBackend = !isCapacitorOrFileEnv || Boolean(getApiBaseUrl());
 
-      // Own backend: the web server, or the backend set in VITE_API_BASE_URL for the APK
+      // 1. Own backend proxy (/api/streamfree-soccer -> ppv.st Football)
       if (hasBackend) {
         try {
           const res = await fetch(withApiBase('/api/streamfree-soccer'));
@@ -177,7 +227,7 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
                   sources: Array.isArray(s.sources)
                     ? s.sources.map((src) => ({
                         ...src,
-                        url: withApiBase(normalizeToStrmfreePk(src.url)),
+                        url: withApiBase(normalizeToPpvSt(src.url)),
                       }))
                     : [],
                 })
@@ -187,65 +237,21 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
             }
           }
         } catch {
-          // Fall through to direct API or local streams
+          // Fall through to direct ppv.st API
         }
       }
 
-      // Direct public strmfree.pk API fallback for static / Capacitor Android APK builds
+      // 2. Direct ppv.st API fallback (for static / Capacitor Android APK builds)
       try {
-        const directRes = await fetch('https://strmfree.pk/api/v1/streams?category=soccer');
+        const directRes = await fetch(PPV_STREAMS_API_URL);
         if (directRes.ok) {
           const raw = await directRes.json();
-          const fullList: any[] = Array.isArray(raw?.streams)
-            ? raw.streams
-            : Array.isArray(raw?.data)
-            ? raw.data
-            : Array.isArray(raw)
-            ? raw
-            : [];
-          const liveList = fullList.filter(
-            (item: any) =>
-              Array.isArray(item?.sources) && item.sources.some((src: any) => src?.live)
-          );
-          const list = liveList.length > 0 ? liveList : fullList;
-          if (list.length > 0) {
-            const mapped: StreamFreeMatchItem[] = list
-              .slice(0, 12)
-              .map((item: any, idx: number) => {
-                const matchName = item.name || item.title || `ការប្រកួតផ្ទាល់ ${idx + 1}`;
-                const league = item.league || item.category || 'បាល់ទាត់ផ្សាយផ្ទាល់';
-                const streamKey = item.stream_key || item.id || '';
-                const defaultKeyEmbed = streamKey
-                  ? `https://strmfree.pk/embed/soccer/${streamKey}1080p`
-                  : '';
-                const rawSources = Array.isArray(item.sources) ? item.sources : [];
-                const sources: StreamSourceItem[] =
-                  rawSources.length > 0
-                    ? rawSources.map((src: any) => ({
-                        url: normalizeToStrmfreePk(src.url || src.embedUrl || defaultKeyEmbed),
-                        quality: src.quality || 'FHD',
-                        live: Boolean(src.live ?? true),
-                      }))
-                    : [
-                        {
-                          url: normalizeToStrmfreePk(item.url || item.embedUrl || defaultKeyEmbed),
-                          quality: 'FHD',
-                          live: true,
-                        },
-                      ];
-                return {
-                  id: String(streamKey || `sf-${idx}`),
-                  name: matchName,
-                  league,
-                  sources: sources.filter((s) => Boolean(s.url)),
-                };
-              })
-              .filter((m: StreamFreeMatchItem) => m.sources.length > 0);
-
-            if (mapped.length > 0) {
-              applyDiscoveredStreams(mapped, silent);
-              return;
-            }
+          const mapped = parsePpvFootballStreams(raw);
+          const liveOnly = mapped.filter((m) => m.sources.some((s) => s.live));
+          const finalList = liveOnly.length > 0 ? liveOnly : mapped;
+          if (finalList.length > 0) {
+            applyDiscoveredStreams(finalList, silent);
+            return;
           }
         }
       } catch {
@@ -307,17 +313,15 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
   useEffect(() => {
     if (hasInitialStreamSyncedRef.current) return;
     hasInitialStreamSyncedRef.current = true;
-    fetchStreamFreeMatches(false);
+    fetchPpvFootballMatches(false);
   }, []);
 
   const displayTime = nowLabel || formatNowTimestamp().timeStr;
-
-  // Match active liveMatch object if the currently playing stream corresponds to one
   const matchedLiveFixture = findMatchingLiveFixture(currentMatchName, liveMatches);
 
   return (
     <div className="liquid-glass rounded-2xl sm:rounded-3xl overflow-hidden animate-liquid-spring">
-      {/* Clean Header Bar Above Video Player (Controls outside the video frame) */}
+      {/* Clean Header Bar Above Video Player */}
       <div className="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-5 py-2.5 sm:py-3.5 border-b border-white/10">
         <div className="flex items-center gap-2 min-w-0">
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#ef4444] text-white text-[10px] sm:text-xs font-extrabold tracking-wider animate-live-radar shrink-0">
@@ -383,7 +387,7 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
           )}
           <button
             type="button"
-            onClick={() => fetchStreamFreeMatches(false)}
+            onClick={() => fetchPpvFootballMatches(false)}
             disabled={loadingSoccerHub}
             aria-label="ផ្ទុកប៉ុស្តិ៍ឡើងវិញ"
             className="min-h-[34px] px-2.5 sm:px-3.5 py-1.5 rounded-full liquid-glass-subtle text-[11px] sm:text-xs font-semibold text-[#f8fafc] hover:border-[#10b981] flex items-center gap-1.5 transition-all active:scale-95"
@@ -582,7 +586,7 @@ export const LiveStreamHub: React.FC<LiveStreamHubProps> = ({
               <div className="flex items-center justify-center gap-2">
                 <button
                   type="button"
-                  onClick={() => fetchStreamFreeMatches(false)}
+                  onClick={() => fetchPpvFootballMatches(false)}
                   className="px-3.5 py-1.5 rounded-full liquid-glass-subtle text-xs font-semibold text-[#f8fafc] hover:border-[#10b981] flex items-center gap-1.5"
                 >
                   <RefreshCw
