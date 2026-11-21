@@ -1,6 +1,5 @@
 import express from 'express';
 import path from 'path';
-import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
@@ -18,13 +17,9 @@ import {
   extractEspnMatchSummaryDetails,
   extractEspnTeamRosterStartingXI,
   extractEspnLiveClock,
-  toSandboxSafeStreamUrl,
-  parseStrmfreeEmbedHtml,
-  rewriteHlsPlaylistForProxy,
   fetchDirectEspnNews,
   computeAccurateTeamForm,
   enrichStandingsWithAccurateForm,
-  ParsedStrmfreeEmbed,
   MatchEvent,
   MatchLineup,
   MatchStatItem,
@@ -38,13 +33,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
-const STREAM_BASE_URL = 'https://strmfree.pk';
+const STREAM_BASE_URL = 'https://ppv.st';
+const PPV_STREAMS_API_URL =
+  (process.env.PPV_STREAMS_API_URL || 'https://ppv.st/api/streams').trim();
 
-function normalizeToStrmfreePk(rawUrl?: string | null): string {
+function normalizeToPpvSt(rawUrl?: string | null): string {
   const trimmed = String(rawUrl || '').trim();
   if (!trimmed) return '';
   return trimmed.replace(
-    /^https?:\/\/(?:www\.)?(?:streamfree\.pk\.top|strmfree\.pk\.st|streamfree\.top|strmfree\.st|streamfree\.pk|strmfree\.pk)/i,
+    /^https?:\/\/(?:www\.)?(?:streamfree\.pk\.top|strmfree\.pk\.st|streamfree\.top|strmfree\.st|streamfree\.pk|strmfree\.pk|ppv\.land|ppv\.wtf|ppv\.st)/i,
     STREAM_BASE_URL
   );
 }
@@ -93,42 +90,89 @@ async function startServer() {
 
   let cachedStreamCatalog: any[] = [];
   let cachedStreamCatalogAt = 0;
-  const cachedParsedEmbeds = new Map<
-    string,
-    { parsed: ParsedStrmfreeEmbed; expiresAt: number }
-  >();
 
-  async function fetchStreamFreeCatalog(): Promise<any[]> {
+  function parsePpvFootballCatalog(data: any): any[] {
+    if (!Array.isArray(data?.streams)) return [];
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    const footballCategory = data.streams.find(
+      (cat: any) => String(cat?.category || '').toLowerCase() === 'football'
+    );
+    if (!footballCategory || !Array.isArray(footballCategory.streams)) return [];
+
+    return footballCategory.streams
+      .map((item: any) => {
+        const startsAt = Number(item.starts_at || 0);
+        const endsAt = Number(item.ends_at || 0);
+        const isLive =
+          Boolean(item.always_live) ||
+          (startsAt > 0 && nowSec >= startsAt - 900 && (endsAt === 0 || nowSec <= endsAt));
+
+        const sources: Array<{ url: string; rawUrl: string; quality: string; live: boolean }> = [];
+
+        const primaryUrl = normalizeToPpvSt(
+          item.iframe || (item.uri_name ? `${STREAM_BASE_URL}/live/${item.uri_name}` : '')
+        );
+        if (primaryUrl) {
+          sources.push({
+            url: primaryUrl,
+            rawUrl: primaryUrl,
+            quality: String(item.source_tag || 'HD').trim(),
+            live: isLive,
+          });
+        }
+
+        if (Array.isArray(item.substreams)) {
+          for (const sub of item.substreams) {
+            const subUrl = normalizeToPpvSt(
+              sub?.iframe || (sub?.uri_name ? `${STREAM_BASE_URL}/live/${sub.uri_name}` : '')
+            );
+            if (subUrl) {
+              sources.push({
+                url: subUrl,
+                rawUrl: subUrl,
+                quality: String(sub.source_tag || 'SD').trim(),
+                live: isLive,
+              });
+            }
+          }
+        }
+
+        return {
+          id: String(item.id || item.uri_name || item.name),
+          name: String(item.name || 'Live Match'),
+          league: String(item.tag || item.category_name || 'Football'),
+          thumbnail_url: String(item.poster || ''),
+          uri_name: String(item.uri_name || ''),
+          viewers: Number(item.viewers || 0),
+          starts_at: startsAt,
+          ends_at: endsAt,
+          sources,
+        };
+      })
+      .filter((s: any) => s.sources.length > 0);
+  }
+
+  async function fetchPpvFootballCatalog(): Promise<any[]> {
     if (cachedStreamCatalog.length > 0 && Date.now() - cachedStreamCatalogAt < 20000) {
       return cachedStreamCatalog;
     }
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
-      const response = await fetch(
-        `${STREAM_BASE_URL}/api/v1/streams?category=soccer`,
-        {
-          signal: controller.signal,
-          headers: {
-            Accept: 'application/json',
-            'User-Agent': STREAM_USER_AGENT,
-          },
-        }
-      );
+      const response = await fetch(PPV_STREAMS_API_URL, {
+        signal: controller.signal,
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': STREAM_USER_AGENT,
+        },
+      });
       clearTimeout(timeout);
       if (response.ok) {
         const data = (await response.json()) as any;
-        if (Array.isArray(data?.streams) && data.streams.length > 0) {
-          cachedStreamCatalog = data.streams.map((s: any) => ({
-            ...s,
-            thumbnail_url: normalizeToStrmfreePk(s.thumbnail_url),
-            sources: Array.isArray(s.sources)
-              ? s.sources.map((src: any) => ({
-                  ...src,
-                  url: normalizeToStrmfreePk(src.url),
-                }))
-              : [],
-          }));
+        const parsed = parsePpvFootballCatalog(data);
+        if (parsed.length > 0) {
+          cachedStreamCatalog = parsed;
           cachedStreamCatalogAt = Date.now();
           return cachedStreamCatalog;
         }
@@ -139,131 +183,10 @@ async function startServer() {
     return cachedStreamCatalog;
   }
 
-  async function fetchAndParseSingleEmbed(
-    rawEmbedUrl: string
-  ): Promise<ParsedStrmfreeEmbed | null> {
-    const embedUrl = normalizeToStrmfreePk(rawEmbedUrl);
-    if (!embedUrl || !embedUrl.startsWith('http')) return null;
-
-    const cached = cachedParsedEmbeds.get(embedUrl);
-    if (cached && cached.expiresAt > Date.now()) {
-      return cached.parsed;
-    }
-
-    try {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 5000);
-      // Do not pass Referer on /embed/soccer/* as strmfree.pk rejects self-referer on embed HTML
-      const res = await fetch(embedUrl, {
-        signal: ctl.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) return null;
-
-      const html = await res.text();
-      const initialParsed = parseStrmfreeEmbedHtml(html, 'origin');
-      if (!initialParsed) return null;
-
-      let serverName = 'origin';
-      try {
-        const keyCtl = new AbortController();
-        const keyTimer = setTimeout(() => keyCtl.abort(), 3000);
-        const keyRes = await fetch(
-          `${STREAM_BASE_URL}/get-stream-key/${encodeURIComponent(initialParsed.baseKey)}`,
-          {
-            signal: keyCtl.signal,
-            headers: {
-              Referer: embedUrl,
-            },
-          }
-        );
-        clearTimeout(keyTimer);
-        if (keyRes.ok) {
-          const keyData = (await keyRes.json()) as any;
-          if (keyData?.server_name) {
-            serverName = String(keyData.server_name);
-          }
-        }
-      } catch {
-        // default to origin
-      }
-
-      const finalParsed =
-        serverName === 'origin'
-          ? initialParsed
-          : parseStrmfreeEmbedHtml(html, serverName) || initialParsed;
-
-      cachedParsedEmbeds.set(embedUrl, {
-        parsed: finalParsed,
-        expiresAt: Date.now() + 20000,
-      });
-      return finalParsed;
-    } catch {
-      return null;
-    }
-  }
-
-  async function resolveWorkingStrmfreeEmbed(
-    requestedUrl: string,
-    requestedTitle?: string
-  ): Promise<ParsedStrmfreeEmbed | null> {
-    const normalizedRequested = normalizeToStrmfreePk(requestedUrl);
-    // 1. Try the requested URL directly if it is a valid http(s) URL
-    if (normalizedRequested && normalizedRequested.startsWith('http')) {
-      const direct = await fetchAndParseSingleEmbed(normalizedRequested);
-      if (direct && direct.isLive && direct.playlistUrl) {
-        return direct;
-      }
-    }
-
-    // 2. Search the active StreamFree soccer catalog for matching team keywords or any active live stream
-    const catalog = await fetchStreamFreeCatalog();
-    if (catalog.length === 0) return null;
-
-    const searchHaystack = `${normalizedRequested || ''} ${requestedTitle || ''}`
-      .toLowerCase()
-      .replace(/https?:\/\/[^/]+\/embed\/soccer\//g, '')
-      .replace(/1080p|720p|540p/g, '')
-      .replace(/[^a-z0-9]+/g, ' ')
-      .trim();
-
-    const keywords = searchHaystack
-      .split(/\s+/)
-      .filter((w) => w.length >= 4 && w !== 'vs' && w !== 'live' && w !== 'club');
-
-    const activeLiveCatalog = catalog.filter(
-      (s: any) => Array.isArray(s.sources) && s.sources.some((src: any) => src.live)
-    );
-
-    const matchStreamByKeywords = (list: any[]) => {
-      if (keywords.length === 0) return null;
-      return list.find((s: any) => {
-        const target = `${s.id || ''} ${s.name || ''}`.toLowerCase();
-        return keywords.some((kw) => target.includes(kw));
-      });
-    };
-
-    const chosenStream =
-      matchStreamByKeywords(activeLiveCatalog) ||
-      activeLiveCatalog[0] ||
-      matchStreamByKeywords(catalog) ||
-      catalog[0];
-
-    if (!chosenStream || !Array.isArray(chosenStream.sources)) return null;
-
-    const bestSource =
-      chosenStream.sources.find((src: any) => src.live && src.quality === 'FHD') ||
-      chosenStream.sources.find((src: any) => src.live) ||
-      chosenStream.sources[0];
-
-    if (!bestSource?.url) return null;
-    return fetchAndParseSingleEmbed(bestSource.url);
-  }
-
-  // 1. Live Soccer Streams API Proxy (with sandbox-safe embed URLs)
-  app.get('/api/streamfree-soccer', async (req, res) => {
+  // 1. Live Football Streams API Proxy (ppv.st Football only)
+  const handlePpvFootballStreams = async (req: express.Request, res: express.Response) => {
     const onlyActiveLive = req.query.all !== 'true';
-    const streams = await fetchStreamFreeCatalog();
+    const streams = await fetchPpvFootballCatalog();
 
     if (streams.length > 0) {
       const activeLiveStreams = streams.filter(
@@ -279,301 +202,37 @@ async function startServer() {
               return Number(bLive) - Number(aLive);
             });
 
-      const safeStreams = baseList.map((s: any) => ({
-        ...s,
-        sources: Array.isArray(s.sources)
-          ? s.sources.map((src: any) => {
-              const normalizedSrcUrl = normalizeToStrmfreePk(src.url);
-              return {
-                ...src,
-                rawUrl: normalizedSrcUrl,
-                url: toSandboxSafeStreamUrl(normalizedSrcUrl, s.name),
-              };
-            })
-          : [],
-      }));
-
       res.json({
-        source: 'strmfree.pk-live',
-        count: safeStreams.length,
+        source: 'ppv.st-live',
+        count: baseList.length,
         totalAvailable: streams.length,
         activeLiveCount: activeLiveStreams.length,
-        streams: safeStreams,
+        streams: baseList,
       });
       return;
     }
 
     res.json({
-      source: 'strmfree.pk-live',
+      source: 'ppv.st-live',
       count: 0,
       totalAvailable: 0,
       activeLiveCount: 0,
       streams: [],
-      message: 'No live streams currently active. Check upcoming fixtures below.',
+      message: 'No live football streams currently active. Check upcoming fixtures below.',
     });
-  });
+  };
 
-  // 1a. HLS Playlist Proxy (bypasses strmfree.pk Referer/Origin restrictions)
-  app.get('/api/stream-hls/playlist', async (req, res) => {
-    const rawUrl = String(req.query.url || '').trim();
-    const title = String(req.query.title || '').trim();
+  app.get('/api/ppv-football', handlePpvFootballStreams);
+  app.get('/api/streamfree-soccer', handlePpvFootballStreams);
 
-    try {
-      const parsed = await resolveWorkingStrmfreeEmbed(rawUrl, title);
-      if (parsed && parsed.playlistUrl) {
-        const ctl = new AbortController();
-        const timer = setTimeout(() => ctl.abort(), 5000);
-        const m3u8Res = await fetch(parsed.playlistUrl, {
-          signal: ctl.signal,
-          headers: {
-            Referer: `${STREAM_BASE_URL}/`,
-          },
-        });
-        clearTimeout(timer);
-
-        if (m3u8Res.ok) {
-          const text = await m3u8Res.text();
-          if (text.includes('#EXTM3U')) {
-            const rewritten = rewriteHlsPlaylistForProxy(text, parsed.playlistUrl);
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.send(rewritten);
-            return;
-          }
-        }
-      }
-    } catch {
-      // Fall through to 404 so client player can switch to fallback broadcast
-    }
-
-    res.status(404).json({ error: 'Upstream HLS playlist unavailable' });
-  });
-
-  // 1b. HLS Segment Proxy (streams MPEG-TS chunks with Referer: https://strmfree.pk/)
-  app.get('/api/stream-hls/segment', async (req, res) => {
-    const primaryUrl = String(req.query.u || '').trim();
-    const fallbackUrl = String(req.query.fallback || '').trim();
-
-    const tryFetchSegment = async (target: string) => {
-      if (!target || !target.startsWith('http')) return null;
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 8000);
-      try {
-        const segRes = await fetch(target, {
-          signal: ctl.signal,
-          headers: {
-            Referer: `${STREAM_BASE_URL}/`,
-          },
-        });
-        clearTimeout(timer);
-        if (segRes.ok && segRes.body) {
-          return segRes;
-        }
-      } catch {
-        clearTimeout(timer);
-      }
-      return null;
-    };
-
-    const upstream =
-      (await tryFetchSegment(primaryUrl)) ||
-      (fallbackUrl ? await tryFetchSegment(fallbackUrl) : null);
-
-    if (!upstream || !upstream.body) {
-      res.status(502).end();
+  // 1b. Direct Embed Wrapper (redirects or embeds ppv.st / taifood-blog.asia stream URL)
+  app.get('/api/stream-embed', async (req, res) => {
+    const rawUrl = normalizeToPpvSt(String(req.query.url || '').trim());
+    if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+      res.redirect(302, rawUrl);
       return;
     }
-
-    res.setHeader('Content-Type', 'video/mp2t');
-    res.setHeader('Cache-Control', 'public, max-age=60');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    try {
-      Readable.fromWeb(upstream.body as any).pipe(res);
-    } catch {
-      res.status(502).end();
-    }
-  });
-
-  // 1c. Sandbox-Safe Live Stream Player Embed Endpoint (eliminates "Embed this stream without sandbox")
-  app.get('/api/stream-embed', async (req, res) => {
-    const rawUrl = String(req.query.url || '').trim();
-    const requestedTitle = String(req.query.title || 'Live Football Broadcast').trim();
-
-    const parsed = await resolveWorkingStrmfreeEmbed(rawUrl, requestedTitle);
-    const activeStreamTitle = parsed?.streamName || requestedTitle;
-    const activeQuality = parsed?.quality || '1080p';
-    const playlistEndpoint = `/api/stream-hls/playlist?url=${encodeURIComponent(
-      rawUrl
-    )}&title=${encodeURIComponent(requestedTitle)}`;
-
-    const safeTitleHtml = activeStreamTitle
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>${safeTitleHtml} — SNP SPORT Live</title>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body {
-      width: 100%;
-      height: 100%;
-      background: #07090e;
-      color: #f8fafc;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      overflow: hidden;
-      user-select: none;
-    }
-    #stage {
-      position: relative;
-      width: 100vw;
-      height: 100vh;
-      background: #05070b;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      background: #000;
-      display: block;
-    }
-    #unmute-btn {
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      z-index: 20;
-      background: rgba(15, 23, 42, 0.78);
-      color: #fbbf24;
-      border: 1px solid rgba(251, 191, 36, 0.4);
-      border-radius: 8px;
-      padding: 5px 10px;
-      font-size: 11px;
-      font-weight: 700;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      backdrop-filter: blur(6px);
-      transition: opacity 0.25s ease;
-    }
-    #unmute-btn:hover { background: rgba(15, 23, 42, 0.95); }
-    #unmute-btn.hidden { display: none; }
-    #stream-status {
-      position: absolute;
-      inset: 0;
-      display: none;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      background: #05070b;
-      color: #94a3b8;
-      font-size: 13px;
-      font-weight: 600;
-      text-align: center;
-      padding: 20px;
-      z-index: 5;
-    }
-    #stream-status.visible { display: flex; }
-  </style>
-</head>
-<body>
-  <div id="stage">
-    <video id="live-video" autoplay muted playsinline controls></video>
-    <div id="stream-status">
-      <span id="stream-status-text">ការផ្សាយផ្ទាល់មិនទាន់មានសញ្ញាវីឌីអូនៅពេលនេះទេ</span>
-    </div>
-    <button id="unmute-btn" type="button">🔊 បើកសំឡេង</button>
-  </div>
-  <script>
-    window.sandDetect = function() {};
-    const video = document.getElementById('live-video');
-    const unmuteBtn = document.getElementById('unmute-btn');
-    const streamStatus = document.getElementById('stream-status');
-    const playlistUrl = ${JSON.stringify(playlistEndpoint)};
-
-    setTimeout(() => {
-      if (unmuteBtn) unmuteBtn.classList.add('hidden');
-    }, 3500);
-
-    unmuteBtn.addEventListener('click', () => {
-      video.muted = false;
-      video.volume = 1.0;
-      video.play().catch(() => {});
-      unmuteBtn.classList.add('hidden');
-    });
-
-    video.addEventListener('volumechange', () => {
-      if (!video.muted && video.volume > 0) {
-        unmuteBtn.classList.add('hidden');
-      }
-    });
-
-    function showStreamUnavailable() {
-      unmuteBtn.classList.add('hidden');
-      if (streamStatus) streamStatus.classList.add('visible');
-    }
-
-    function attachHls(sourceUrl) {
-      if (!sourceUrl) {
-        showStreamUnavailable();
-        return;
-      }
-      if (window.Hls && Hls.isSupported()) {
-        const hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: true,
-          backBufferLength: 30,
-          manifestLoadingTimeOut: 10000,
-          manifestLoadingMaxRetry: 2,
-          levelLoadingTimeOut: 10000,
-          fragLoadingTimeOut: 12000,
-        });
-        hls.loadSource(sourceUrl);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, function() {
-          if (streamStatus) streamStatus.classList.remove('visible');
-          video.play().catch(function() {});
-        });
-        hls.on(Hls.Events.ERROR, function(_ev, data) {
-          if (data && data.fatal) {
-            hls.destroy();
-            showStreamUnavailable();
-          }
-        });
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = sourceUrl;
-        video.addEventListener('loadedmetadata', function() {
-          if (streamStatus) streamStatus.classList.remove('visible');
-          video.play().catch(function() {});
-        });
-        video.addEventListener('error', function() {
-          showStreamUnavailable();
-        });
-      } else {
-        showStreamUnavailable();
-      }
-    }
-
-    attachHls(playlistUrl);
-  </script>
-</body>
-</html>`;
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-store');
-    res.send(html);
+    res.status(404).send('Stream URL unavailable');
   });
 
   // 1c. Gemini AI Match Predict & Tactical Analysis Endpoint
@@ -1209,7 +868,7 @@ async function startServer() {
     return performTopScorersRefresh();
   }
 
-  // 1b. Free ESPN Sports Live API Endpoint across Top 5 Leagues + UCL
+  // Free ESPN Sports Live API Endpoint across Top 5 Leagues + UCL
   const handleFreeSportsLive = async (_req: express.Request, res: express.Response) => {
     const allFixtures = await fetchFreeSportsLiveFixtures();
     res.json({
@@ -1393,7 +1052,7 @@ async function startServer() {
       performFixturesRefresh(),
       performStandingsRefresh(),
       performTopScorersRefresh(),
-      fetchStreamFreeCatalog(),
+      fetchPpvFootballCatalog(),
     ]).catch(() => {});
   };
 
